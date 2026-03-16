@@ -1,0 +1,5 @@
+.venv 
+README.md
+__pycache__
+.env
+DATABASE_SUMMARY.md

@@ -1,0 +1,12 @@
+[project]
+name = "appflowy-cloud-mcp"
+version = "0.1.0"
+description = "AppFlowy Cloud MCP server for workspace, database, and row operations"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=3.1.1",
+    "python-dotenv>=1.2.2",
+    "httpx>=0.27.0",
+    "pydantic>=2.6.0",
+]
