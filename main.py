@@ -251,39 +251,5 @@ def appflowy_upsert_row(workspace_id: str, database_id: str, request: RowUpdateR
         )
 
 
-# ==================== ORIGINAL TODOIST TOOLS ====================
-
-
-@mcp.tool
-def hello(name: str):
-    print(f"Hello {name}")
-
-
-@mcp.tool
-def get_tasks():
-    base_url = "https://todoist.com/api/v1/tasks"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('TODOIDT_API_KEY')}",
-        "Content-Type": "application/json",
-    }
-    response = httpx.get(base_url, headers=headers)
-    return response.json()
-
-
-@mcp.tool(
-    name="add_task",
-    description="Add a task to todoist it needs a task object that has the following fields: content, description, project_id, priority the priority system work 1 means unimportant and 4 means very important ",
-)
-def add_task(task: Task):
-    base_url = "https://todoist.com/api/v1/tasks"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('TODOIDT_API_KEY')}",
-        "Content-Type": "application/json",
-    }
-    data = task.dict()
-    response = httpx.post(base_url, headers=headers, json=data)
-    return response.json()
-
-
 if __name__ == "__main__":
     mcp.run()
