@@ -11,40 +11,42 @@ from src.models import (
     RowCreateRequest,
     RowUpdateRequest,
 )
-import httpx
 from dotenv import load_dotenv
+
+from appflowysdk import AppFlowy
+from appflowysdk.exceptions import AppFlowyError, LoginError, RefreshTokenError, APIError, ValidationError, NetworkError
 
 load_dotenv()
 
 mcp = FastMCP("appflowy-cloud")
 
-# In-memory token storage (could be replaced with Redis/DB for production)
-token_store = {"access_token": None, "refresh_token": None}
+# Global AppFlowy client
+client = AppFlowy(
+    email=os.getenv("APPFLOWY_EMAIL"),
+    password=os.getenv("APPFLOWY_PASSWORD")
+)
 
 # ==================== AUTHENTICATION TOOLS ====================
-
 
 @mcp.tool(
     name="appflowy_login",
     description="Login to AppFlowy Cloud and get access token. Returns access token and refresh token.",
 )
 def appflowy_login(request: LoginRequest):
-    """Login to AppFlowy Cloud using email and password."""
-    url = "https://beta.appflowy.cloud/gotrue/token?grant_type=password"
-    headers = {
-        "Content-Type": "application/json",
-    }
-    data = {"email": request.email, "password": request.password}
-
-    response = httpx.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        # Store tokens in memory
-        token_store["access_token"] = result.get("access_token")
-        token_store["refresh_token"] = result.get("refresh_token")
-        return result
-    else:
-        raise Exception(f"Login failed: {response.status_code} - {response.text}")
+    """Login to AppFlowy Cloud. Can use provided credentials or fallback to APPFLOWY_EMAIL/APPFLOWY_PASSWORD env vars."""
+    if request.email:
+        client.email = request.email
+    if request.password:
+        client.password = request.password
+        
+    if not client.email or not client.password:
+        raise Exception("Email and password must be provided either in the request or via APPFLOWY_EMAIL and APPFLOWY_PASSWORD env vars")
+        
+    try:
+        result = client.login()
+        return {"access_token": result.access_token, "refresh_token": result.refresh_token}
+    except Exception as e:
+        raise Exception(f"Login failed: {str(e)}")
 
 
 @mcp.tool(
@@ -53,27 +55,15 @@ def appflowy_login(request: LoginRequest):
 )
 def appflowy_refresh_token(request: RefreshTokenRequest):
     """Refresh AppFlowy Cloud access token."""
-    url = "https://beta.appflowy.cloud/gotrue/token?grant_type=refresh_token"
-    headers = {
-        "Content-Type": "application/json",
-    }
-    data = {"refresh_token": request.refresh_token}
-
-    response = httpx.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        result = response.json()
-        # Update stored tokens
-        token_store["access_token"] = result.get("access_token")
-        token_store["refresh_token"] = result.get("refresh_token")
-        return result
-    else:
-        raise Exception(
-            f"Token refresh failed: {response.status_code} - {response.text}"
-        )
+    client.token_store.set_refresh_token(request.refresh_token)
+    try:
+        result = client.refresh_token()
+        return {"access_token": result.access_token, "refresh_token": result.refresh_token}
+    except Exception as e:
+        raise Exception(f"Token refresh failed: {str(e)}")
 
 
 # ==================== WORKSPACE TOOLS ====================
-
 
 @mcp.tool(
     name="appflowy_list_workspaces",
@@ -81,50 +71,31 @@ def appflowy_refresh_token(request: RefreshTokenRequest):
 )
 def appflowy_list_workspaces():
     """List all AppFlowy workspaces."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = "https://beta.appflowy.cloud/api/workspace"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to list workspaces: {response.status_code} - {response.text}"
-        )
+    try:
+        workspaces = client.get_workspaces()
+        return [w.model_dump() for w in workspaces]
+    except Exception as e:
+        raise Exception(f"Failed to list workspaces: {str(e)}")
 
 
 # ==================== DATABASE TOOLS ====================
-
 
 @mcp.tool(
     name="appflowy_list_databases", description="List all databases in a workspace."
 )
 def appflowy_list_databases(workspace_id: str):
     """List all databases in a workspace."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to list databases: {response.status_code} - {response.text}"
-        )
+    try:
+        databases = client.get_databases(workspace_id)
+        return [d.model_dump() for d in databases]
+    except Exception as e:
+        raise Exception(f"Failed to list databases: {str(e)}")
 
 
 @mcp.tool(
@@ -133,48 +104,29 @@ def appflowy_list_databases(workspace_id: str):
 )
 def appflowy_get_database_fields(workspace_id: str, database_id: str):
     """Get fields of a specific database."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database/{database_id}/fields"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to get database fields: {response.status_code} - {response.text}"
-        )
+    try:
+        fields = client.get_database_fields(workspace_id, database_id)
+        return [f.model_dump() for f in fields]
+    except Exception as e:
+        raise Exception(f"Failed to get database fields: {str(e)}")
 
 
 # ==================== ROW TOOLS ====================
 
-
 @mcp.tool(name="appflowy_list_rows", description="List all row IDs in a database.")
 def appflowy_list_rows(workspace_id: str, database_id: str):
     """List all row IDs in a database."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database/{database_id}/row"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to list rows: {response.status_code} - {response.text}"
-        )
+    try:
+        rows = client.get_database_row_ids(workspace_id, database_id)
+        return [r.model_dump() for r in rows]
+    except Exception as e:
+        raise Exception(f"Failed to list rows: {str(e)}")
 
 
 @mcp.tool(
@@ -184,46 +136,35 @@ def appflowy_get_row_details(
     workspace_id: str, database_id: str, row_ids: str, with_doc: bool = False
 ):
     """Get details of specific rows. row_ids should be comma-separated UUIDs."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database/{database_id}/row/detail"
-    params = {"ids": row_ids, "with_doc": str(with_doc).lower()}
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.get(url, headers=headers, params=params)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to get row details: {response.status_code} - {response.text}"
+    try:
+        ids_list = [id.strip() for id in row_ids.split(",") if id.strip()]
+        if not ids_list:
+            raise Exception("At least one row ID is required.")
+            
+        details = client.get_database_row_details(
+            workspace_id, database_id, ids_list, with_doc=with_doc
         )
+        return [d.model_dump() for d in details]
+    except Exception as e:
+        raise Exception(f"Failed to get row details: {str(e)}")
 
 
 @mcp.tool(name="appflowy_create_row", description="Create a new row in a database.")
 def appflowy_create_row(workspace_id: str, database_id: str, request: RowCreateRequest):
     """Create a new row in a database."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database/{database_id}/row"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.post(url, headers=headers, json=request.dict())
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to create row: {response.status_code} - {response.text}"
+    try:
+        row_id = client.create_database_row(
+            workspace_id, database_id, cells=request.cells, document=request.document
         )
+        return {"id": row_id}
+    except Exception as e:
+        raise Exception(f"Failed to create row: {str(e)}")
 
 
 @mcp.tool(
@@ -232,23 +173,37 @@ def appflowy_create_row(workspace_id: str, database_id: str, request: RowCreateR
 )
 def appflowy_upsert_row(workspace_id: str, database_id: str, request: RowUpdateRequest):
     """Update existing row or create if it doesn't exist."""
-    access_token = token_store.get("access_token")
-    if not access_token:
+    if not client.token_store.get_access_token():
         raise Exception("Not authenticated. Please login first.")
 
-    url = f"https://beta.appflowy.cloud/api/workspace/{workspace_id}/database/{database_id}/row"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    response = httpx.put(url, headers=headers, json=request.dict())
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(
-            f"Failed to upsert row: {response.status_code} - {response.text}"
+    try:
+        row_id = client.upsert_database_row(
+            workspace_id, 
+            database_id, 
+            request.pre_hash or "", 
+            cells=request.cells, 
+            document=request.document
         )
+        return {"id": row_id}
+    except Exception as e:
+        raise Exception(f"Failed to upsert row: {str(e)}")
+
+@mcp.tool(
+    name="appflowy_get_updated_rows", 
+    description="Find updated rows in a database after a specific datetime."
+)
+def appflowy_get_updated_rows(workspace_id: str, database_id: str, after: str):
+    """Find updated rows after a specific datetime (ISO 8601 string)."""
+    if not client.token_store.get_access_token():
+        raise Exception("Not authenticated. Please login first.")
+
+    try:
+        updated_rows = client.get_database_row_ids_updated(
+            workspace_id, database_id, after=after
+        )
+        return [r.model_dump() for r in updated_rows]
+    except Exception as e:
+        raise Exception(f"Failed to get updated rows: {str(e)}")
 
 
 if __name__ == "__main__":

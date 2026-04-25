@@ -9,4 +9,5 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "httpx>=0.27.0",
     "pydantic>=2.6.0",
+    "appflowysdk>=0.1.2",
 ]

@@ -5,8 +5,8 @@ from typing import Optional, Dict, Any, List
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: Optional[str] = None
+    password: Optional[str] = None
 
 
 class RefreshTokenRequest(BaseModel):
