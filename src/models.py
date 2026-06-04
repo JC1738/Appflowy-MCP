@@ -1,7 +1,11 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, Dict, Any, List
 
 # AppFlowy Cloud Models
+
+
+class FlexiblePayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 class LoginRequest(BaseModel):

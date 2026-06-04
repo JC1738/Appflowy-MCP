@@ -50,7 +50,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "appflowysdk", specifier = ">=0.1.2" },
+    { name = "appflowysdk", specifier = ">=0.1.3" },
     { name = "fastmcp", specifier = ">=3.1.1" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pydantic", specifier = ">=2.6.0" },
@@ -59,15 +59,15 @@ requires-dist = [
 
 [[package]]
 name = "appflowysdk"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/fa/33d5e77c5248bc5ba6129b846e48a69f3499d4ec4fc89165ebf74f433f31/appflowysdk-0.1.2.tar.gz", hash = "sha256:bc5a0d774e5a5b15de21ef9e27718576dad3ac2994dfeeaddb018d0a1eb7245e", size = 8892, upload-time = "2026-03-31T00:46:23.861Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/e8/6298264e0e2b1d31ce818fa28c145a90f0f4f06b6e04cb90f0b71ea86411/appflowysdk-0.1.3.tar.gz", hash = "sha256:5b4fbda045db4df603473adafdbc93139476c155c0a5ccc4d0df3f527721a154", size = 13157, upload-time = "2026-05-19T04:23:57.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/fe/82b6f40769814bc2e6779041bfa95ae0dffa9eb6661303f5930041bbbf21/appflowysdk-0.1.2-py3-none-any.whl", hash = "sha256:5feffc8827f95628644bb732e2aec5a92c2b5160c02d824cee737c2023df7573", size = 9628, upload-time = "2026-03-31T00:46:22.943Z" },
+    { url = "https://files.pythonhosted.org/packages/df/d7/7d52cc61e7f88a26dce1a6080b9ae9a0a601f62cc825c3e6d13acfd91f46/appflowysdk-0.1.3-py3-none-any.whl", hash = "sha256:76ba7e4a86b927bf50aa43e6d1ee9c53bf550d6cbbe2e1c8a669e9f061cd11f5", size = 12278, upload-time = "2026-05-19T04:23:56.646Z" },
 ]
 
 [[package]]
