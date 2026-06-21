@@ -1,6 +1,6 @@
 .venv 
 README.md
-__pycache__
+__pycache__/
 .env
 .idea
 .mcp.json
