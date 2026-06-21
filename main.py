@@ -122,6 +122,111 @@ def _api(
         raise Exception(f"{method} {path} returned non-JSON: {resp.text[:200]}")
 
 
+# ---- Raw binary request + realtime full-sync (CT-13 robustness) -------------
+# The persisted /collab doc_state snapshot can LAG the realtime in-memory doc for
+# a window after a web-update. A read-modify-write that loads that stale base then
+# computes deletes against blocks the live doc no longer has at those positions,
+# so the new content is ADDED instead of replacing -> the page DUPLICATES on a
+# re-update; read-back also drops inline marks (stale external_ids don't match the
+# live structure). The realtime full-sync endpoint (the path the web client uses)
+# always returns the live merged state, so we load through it instead.
+
+
+def _post_raw(path: str, body: bytes, _retried: bool = False) -> httpx.Response:
+    """POST raw bytes (protobuf) and return the raw response; 401 -> refresh once."""
+    token = _require_access_token()
+    try:
+        resp = httpx.post(
+            f"{BASE_URL}{path}",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=60.0,
+        )
+    except httpx.RequestError as e:
+        raise Exception(f"Network error calling POST {path}: {e}") from e
+    if resp.status_code == 401 and not _retried:
+        try:
+            client.refresh_token()
+        except Exception as e:
+            raise Exception(
+                f"POST {path} -> 401 and token refresh failed: {e} "
+                "(call appflowy_login first)"
+            ) from e
+        return _post_raw(path, body, _retried=True)
+    if resp.status_code >= 400:
+        raise Exception(f"POST {path} -> {resp.status_code}: {resp.text[:300]}")
+    return resp
+
+
+# NOTE: the appflowysdk ships full_sync_collab()/CollabDocStateParams but they are
+# unusable here — the model has only `doc_state` (the real proto has 5 fields) and
+# the method POSTs JSON, while the server decodes protobuf. So we hand-encode the
+# protobuf body below instead of calling the SDK.
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _encode_collab_doc_state_params(
+    object_id: str, sv: bytes, doc_state: bytes, collab_type: int = 0
+) -> bytes:
+    """Encode CollabDocStateParams (proto3) for the full-sync endpoint.
+
+    Fields: 1 object_id(str), 2 collab_type(int32), 3 compression(enum — omitted
+    => NONE, so the request body is uncompressed), 4 sv(bytes), 5 doc_state(bytes).
+    """
+    ob = object_id.encode("utf-8")
+    body = bytearray()
+    body += b"\x0a" + _pb_varint(len(ob)) + ob                       # 1 object_id
+    body += b"\x10" + _pb_varint(collab_type)                        # 2 collab_type
+    body += b"\x22" + _pb_varint(len(sv)) + bytes(sv)               # 4 sv
+    body += b"\x2a" + _pb_varint(len(doc_state)) + bytes(doc_state)  # 5 doc_state
+    return bytes(body)
+
+
+def _zstd_decompress(data: bytes) -> bytes:
+    import io
+    import zstandard  # only imported if a deployment compresses the response
+
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(io.BytesIO(data)) as r:
+        return r.read()
+
+
+def _full_sync_doc_state(workspace_id: str, view_id: str) -> bytes:
+    """Return the CURRENT (realtime) document as a yrs update via full-sync.
+
+    We send an empty-doc state vector so the server returns the entire live doc,
+    and an empty-doc update (a no-op merge — the server rejects a truly empty
+    doc_state). The response is a raw yrs update on this deployment; if a build
+    zstd-compresses it (detected by the frame magic) we decompress it.
+    """
+    from pycrdt import Doc
+
+    d0 = Doc()
+    sv0 = bytes(d0.get_state())
+    upd0 = bytes(d0.get_update())
+    body = _encode_collab_doc_state_params(view_id, sv0, upd0, 0)
+    resp = _post_raw(
+        f"/api/workspace/v1/{workspace_id}/collab/{view_id}/full-sync", body
+    )
+    data = resp.content
+    if data[:4] == b"\x28\xb5\x2f\xfd":  # zstd frame magic
+        data = _zstd_decompress(data)
+    return data
+
+
 def _render_delta(delta_json):
     if not delta_json:
         return ""
@@ -972,6 +1077,13 @@ def _crdt_text_deltas(workspace_id: str, view_id: str) -> dict[str, str]:
         from pycrdt import Doc, Map
     except Exception:
         return {}
+    # Read from the persisted /collab snapshot (a plain, side-effect-free GET).
+    # We deliberately do NOT full-sync here: full-sync opens a realtime session and
+    # submits a (no-op) update, i.e. a WRITE — far too heavy for a hot read path
+    # hit on every get_page_markdown. The only downside is that marks read back
+    # immediately after an in-place write may be momentarily stale until the
+    # snapshot catches up; re-read shortly after to confirm (the write tool also
+    # verifies its own result).
     try:
         resp = _api(
             "GET",
@@ -1219,8 +1331,13 @@ def _add_block_to_crdt(serde, parent_id, parent_children_key, blocks, cm, tm, Ma
         "code/strikethrough/links). Pass empty markdown to clear the page. "
         "NOTE: this is a read-modify-write on the page CRDT with no locking, so "
         "it is not safe against another client editing the SAME page "
-        "concurrently (intended for agent-owned docs); on a 2xx it reports the "
-        "update as submitted — re-read with get_page_markdown to confirm."
+        "concurrently (intended for agent-owned docs). Reliable for a "
+        "single-writer, clean page edited sequentially; if the server's live doc "
+        "has diverged (concurrent edit, or a page already duplicated by an earlier "
+        "bad write) the replace may not converge — the tool runs a post-write "
+        "check and returns ok=false + a warning if the page looks duplicated, in "
+        "which case recreate the page via create_page_from_markdown. On ok=true, "
+        "re-read with get_page_markdown to confirm."
     ),
 )
 def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown: str):
@@ -1233,24 +1350,27 @@ def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown
                 "pycrdt is required for in-place page updates but is not "
                 f"available: {e} (add `--with pycrdt` to the MCP launch args)"
             )
-        # Fetch the raw document CRDT (doc_state) — the binary collab endpoint,
-        # not the flattened /json one (which can't be re-encoded losslessly).
-        raw = _api(
-            "GET",
-            f"/api/workspace/{workspace_id}/collab/{view_id}",
-            json_body={
-                "workspace_id": workspace_id,
-                "inner": {"object_id": view_id, "collab_type": 0},
-            },
-        )
-        doc_state = raw.get("data", {}).get("doc_state")
-        if not doc_state:
+        # Load the CURRENT (realtime) document state via full-sync. The persisted
+        # /collab snapshot can lag recent web-update edits; loading a stale base
+        # makes the delete step miss the live blocks, so a re-update DUPLICATES the
+        # page instead of replacing it. full-sync round-trips the live state so the
+        # deletes below reference the live items.
+        # LIMITATION (verified): this is safe for a single-writer, clean,
+        # freshly-loaded page edited once. It is NOT guaranteed to converge if the
+        # server's live doc has diverged from this snapshot (concurrent edit, or a
+        # page already duplicated by a prior bad write): the web-update delete set
+        # is diffed locally (get_update(state_before)), not against the server's
+        # advertised state vector, so deletes can be dropped server-side and
+        # content can still stack. The post-write check below catches that case;
+        # recreate via create_page_from_markdown if it trips.
+        live_update = _full_sync_doc_state(workspace_id, view_id)
+        if not live_update:
             raise Exception(
-                "Could not fetch document doc_state (is this a document page?)"
+                "full-sync returned no document state (is this a document page?)"
             )
         doc = Doc()
         data = doc.get("data", type=Map)
-        doc.apply_update(bytes(doc_state))
+        doc.apply_update(live_update)
         if "document" not in data:
             raise Exception("Unexpected collab structure (no 'document' map)")
         document = data["document"]
@@ -1297,12 +1417,39 @@ def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown
             f"/api/workspace/v1/{workspace_id}/collab/{view_id}/web-update",
             json_body={"doc_state": list(update), "collab_type": 0},
         )
-        return {
+
+        result = {
             "ok": True,
             "view_id": view_id,
             "blocks": len(new_blocks),
             "note": "update submitted; re-read with get_page_markdown to confirm",
         }
+        # Post-write verification: re-read the live doc and confirm the page now has
+        # exactly len(new_blocks) top-level children. A mismatch means the delete
+        # set didn't apply against the realtime doc (identity divergence) and the
+        # content stacked — fail loudly so the caller doesn't trust a duplicated page.
+        try:
+            verify = _full_sync_doc_state(workspace_id, view_id)
+            vdoc = Doc()
+            vdata = vdoc.get("data", type=Map)
+            vdoc.apply_update(verify)
+            vdocument = vdata["document"]
+            vpage = vdocument["page_id"]
+            vkey = vdocument["blocks"][vpage]["children"]
+            live_top = len(list(vdocument["meta"]["children_map"][vkey]))
+            if live_top != len(new_blocks):
+                result["ok"] = False
+                result["warning"] = (
+                    f"post-write check FAILED: page has {live_top} top-level blocks "
+                    f"but {len(new_blocks)} were written — the in-place replace did "
+                    "not fully apply (realtime delete-identity divergence); the page "
+                    "is likely duplicated. Recreate via create_page_from_markdown."
+                )
+            else:
+                result["verified_top_level_blocks"] = live_top
+        except Exception as e:
+            result["note"] += f" (post-write verify skipped: {e})"
+        return result
     except Exception as e:
         raise Exception(f"Failed to update page from markdown: {str(e)}")
 
