@@ -1298,22 +1298,23 @@ def _add_block_to_crdt(serde, parent_id, parent_children_key, blocks, cm, tm, Ma
         # makes yrs *extend* the mark into the neighbour (formatting bleed), so we
         # never pass attributes to insert() — format() on a fixed [start,stop) is
         # the only bleed-free way to write a rich-text delta.
-        # Offsets are code points: correct for BMP text. KNOWN LIMITATION — a
-        # block that mixes astral characters (emoji) AND inline marks can have a
-        # mark misaligned (a pycrdt/yrs quirk with surrogate indexing); plain
-        # emoji text is unaffected (insert handles it; no format() is called).
+        # IMPORTANT: pycrdt's Text.format() indexes by UTF-8 BYTE offset, not by
+        # code point. Computing ranges with len(str) silently misaligns every mark
+        # that follows a multi-byte character (em-dash "—", middot "·", arrow "→",
+        # accented letters, emoji, …). So accumulate byte offsets via utf-8 encode.
         full = "".join(op.get("insert", "") for op in delta)
         if full:
             text.insert(0, full)
-        idx = 0
+        idx = 0  # byte offset into the UTF-8 encoding of `full`
         for op in delta:
             ins = op.get("insert", "")
             if not ins:
                 continue
+            blen = len(ins.encode("utf-8"))
             attrs = op.get("attributes") or None
             if attrs:
-                text.format(idx, idx + len(ins), attrs)
-            idx += len(ins)
+                text.format(idx, idx + blen, attrs)
+            idx += blen
     cm[parent_children_key].append(bid)
     for child in serde.get("children") or []:
         _add_block_to_crdt(child, bid, ch_key, blocks, cm, tm, Map, Array, Text)
