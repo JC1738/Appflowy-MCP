@@ -7,7 +7,6 @@ import os
 import re
 import secrets
 import string
-import time
 from pathlib import Path
 from typing import Any
 
@@ -212,20 +211,27 @@ def _zstd_decompress(data: bytes) -> bytes:
         return r.read()
 
 
-def _full_sync_doc_state(workspace_id: str, view_id: str) -> bytes:
-    """Return the CURRENT (realtime) document as a yrs update via full-sync.
+def _full_sync_exchange(
+    workspace_id: str, view_id: str, sv: bytes, doc_state: bytes, collab_type: int = 0
+) -> bytes:
+    """One full-sync round-trip against the realtime group, decoded.
 
-    We send an empty-doc state vector so the server returns the entire live doc,
-    and an empty-doc update (a no-op merge — the server rejects a truly empty
-    doc_state). The response is a raw yrs update on this deployment; if a build
-    zstd-compresses it (detected by the frame magic) we decompress it.
+    The server APPLIES `doc_state` to its in-memory collab group, then (because we
+    also send our state vector `sv`) replies with exactly the update we are missing
+    relative to `sv`. So this single primitive backs both directions:
+      * READ  — send an empty-doc sv + empty-doc update => the reply is the whole
+                live doc (we are missing everything).
+      * WRITE — send our post-mutation sv + our incremental update => the server
+                applies the mutation and the reply is the post-apply diff we lack
+                (i.e. any blocks still live server-side that our write didn't
+                account for — the signal the caller uses to detect divergence).
+    Crucially READ and WRITE hit the SAME group, so a write can never diverge from
+    the state a read just observed by going through a different endpoint, and the
+    apply is synchronous (the HTTP response only returns after the group applied),
+    so there is no async settle race. The reply is a raw yrs update on this
+    deployment; if a build zstd-compresses it (frame magic) we decompress.
     """
-    from pycrdt import Doc
-
-    d0 = Doc()
-    sv0 = bytes(d0.get_state())
-    upd0 = bytes(d0.get_update())
-    body = _encode_collab_doc_state_params(view_id, sv0, upd0, 0)
+    body = _encode_collab_doc_state_params(view_id, sv, doc_state, collab_type)
     resp = _post_raw(
         f"/api/workspace/v1/{workspace_id}/collab/{view_id}/full-sync", body
     )
@@ -233,6 +239,21 @@ def _full_sync_doc_state(workspace_id: str, view_id: str) -> bytes:
     if data[:4] == b"\x28\xb5\x2f\xfd":  # zstd frame magic
         data = _zstd_decompress(data)
     return data
+
+
+def _full_sync_doc_state(workspace_id: str, view_id: str) -> bytes:
+    """Return the CURRENT (realtime) document as a yrs update via full-sync.
+
+    We send an empty-doc state vector so the server returns the entire live doc,
+    and an empty-doc update (a no-op merge — the server rejects a truly empty
+    doc_state).
+    """
+    from pycrdt import Doc
+
+    d0 = Doc()
+    sv0 = bytes(d0.get_state())
+    upd0 = bytes(d0.get_update())
+    return _full_sync_exchange(workspace_id, view_id, sv0, upd0, 0)
 
 
 def _render_delta(delta_json):
@@ -1250,15 +1271,19 @@ def appflowy_create_page_from_markdown(
         raise Exception(f"Failed to create page from markdown: {str(e)}")
 
 
-# ---- In-place page-content replace via pycrdt collab surgery (CT-13) ----
+# ---- In-place page-content replace via pycrdt collab surgery (CT-13/CT-14) ----
 # There is no "clear/replace blocks" REST endpoint (only append-block / move /
 # trash / icon — verified in src/api/workspace.rs). To replace a page's body
 # while preserving its view_id, we mutate the document CRDT directly: load the
-# raw doc_state into a pycrdt.Doc, delete every block except the root page block
-# (plus its children_map / text_map entries), insert the new blocks, then push
-# the resulting *incremental* yrs update to the web-update endpoint (the same
-# path the web client uses for edits): POST /api/workspace/v1/{ws}/collab/{view}
-# /web-update  body {doc_state:[u8...], collab_type:0}.
+# live doc via full-sync into a pycrdt.Doc, delete every block except the root
+# page block (plus its children_map / text_map entries), insert the new blocks,
+# then push the resulting *incremental* yrs update back through the SAME full-sync
+# endpoint. CT-14: full-sync applies the update synchronously and returns the
+# post-apply diff, so the write is self-verifying and a reconcile loop converges
+# even a divergent/duplicated page in place (see appflowy_update_page_from_markdown
+# and _full_sync_exchange). The old async web-update endpoint is no longer used by
+# this path — it could not confirm its own result and so could only bail on
+# divergence.
 #
 # Document CRDT schema (confirmed live):
 #   data.document = {page_id, blocks, meta:{children_map, text_map}}
@@ -1328,6 +1353,74 @@ def _add_block_to_crdt(serde, parent_id, parent_children_key, blocks, cm, tm, Ma
         _add_block_to_crdt(child, bid, ch_key, blocks, cm, tm, Map, Array, Text)
 
 
+def _load_live_document(workspace_id: str, view_id: str):
+    """Load the current realtime doc via full-sync into a fresh pycrdt Doc.
+
+    Returns (doc, data) where data is the top-level 'data' Map. Raises if the
+    view is not a document collab.
+    """
+    from pycrdt import Doc, Map
+
+    live = _full_sync_doc_state(workspace_id, view_id)
+    if not live:
+        raise Exception(
+            "full-sync returned no document state (is this a document page?)"
+        )
+    doc = Doc()
+    data = doc.get("data", type=Map)
+    doc.apply_update(live)
+    if "document" not in data:
+        raise Exception("Unexpected collab structure (no 'document' map)")
+    return doc, data
+
+
+def _rewrite_page_to_blocks(doc, data, new_blocks) -> bytes:
+    """Set `doc`'s page to exactly `new_blocks`: delete every non-page block (and
+    its children_map/text_map entries), clear the page children array, then insert
+    the new blocks fresh. Returns the incremental yrs update (deletes + inserts),
+    anchored at the doc's pre-mutation state vector so it carries only the change.
+    """
+    from pycrdt import Map, Array, Text
+
+    document = data["document"]
+    page_id = document["page_id"]
+    blocks = document["blocks"]
+    meta = document["meta"]
+    cm = meta["children_map"]
+    tm = meta["text_map"]
+    if page_id not in blocks:
+        raise Exception("Unexpected document structure (page block missing)")
+    page_children_key = blocks[page_id]["children"]
+    state_before = doc.get_state()
+    with doc.transaction():
+        for bid in list(blocks.keys()):
+            if bid == page_id:
+                continue
+            blk = blocks[bid]
+            keys = list(blk.keys())
+            ck = blk["children"] if "children" in keys else None
+            ext = blk["external_id"] if "external_id" in keys else None
+            del blocks[bid]
+            if ck is not None and ck in cm:
+                del cm[ck]
+            if ext is not None and ext in tm:
+                del tm[ext]
+        del cm[page_children_key][:]  # slice-delete is O(n)
+        for serde in new_blocks:
+            _add_block_to_crdt(
+                serde, page_id, page_children_key, blocks, cm, tm, Map, Array, Text
+            )
+    return doc.get_update(state_before)
+
+
+def _page_top_level_count(data) -> int:
+    """Number of direct children under the page block (top-level block count)."""
+    document = data["document"]
+    page_id = document["page_id"]
+    page_children_key = document["blocks"][page_id]["children"]
+    return len(list(document["meta"]["children_map"][page_children_key]))
+
+
 @mcp.tool(
     name="appflowy_update_page_from_markdown",
     description=(
@@ -1338,144 +1431,87 @@ def _add_block_to_crdt(serde, parent_id, parent_children_key, blocks, cm, tm, Ma
         "create_page_from_markdown (headings, bulleted/numbered/todo lists with "
         "nesting, quotes, code fences, dividers, GFM tables, inline bold/italic/"
         "code/strikethrough/links). Pass empty markdown to clear the page. "
-        "NOTE: this is a read-modify-write on the page CRDT with no locking, so "
-        "it is not safe against another client editing the SAME page "
-        "concurrently (intended for agent-owned docs). Reliable for a "
-        "single-writer, clean page edited sequentially; if the server's live doc "
-        "has diverged (concurrent edit, or a page already duplicated by an earlier "
-        "bad write) the replace may not converge — the tool runs a post-write "
-        "check and returns ok=false + a warning if the page looks duplicated, in "
-        "which case recreate the page via create_page_from_markdown. On ok=true, "
-        "re-read with get_page_markdown to confirm."
+        "The write goes through the realtime full-sync endpoint (synchronous "
+        "apply + post-apply read-back) and reconciles: if the live page had "
+        "diverged (a concurrent edit, or a page already duplicated by an earlier "
+        "bad write) the tool re-reads the now-current blocks and rewrites until "
+        "the page converges to exactly the target, so a duplicated/corrupted page "
+        "is repaired in place — no recreate, view_id unchanged. ok=true means the "
+        "post-write top-level block count matched what was written. NOTE: still a "
+        "read-modify-write with no locking — not safe against another client "
+        "editing the SAME page truly concurrently (intended for agent-owned docs); "
+        "in the rare case it cannot converge within its retry budget it returns "
+        "ok=false (recreate via create_page_from_markdown). On ok=true, re-read "
+        "with get_page_markdown to confirm."
     ),
 )
 def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown: str):
     _require_access_token()
     try:
         try:
-            from pycrdt import Doc, Map, Array, Text
+            import pycrdt  # noqa: F401  (presence check; helpers import lazily)
         except Exception as e:
             raise Exception(
                 "pycrdt is required for in-place page updates but is not "
                 f"available: {e} (add `--with pycrdt` to the MCP launch args)"
             )
-        # Load the CURRENT (realtime) document state via full-sync. The persisted
-        # /collab snapshot can lag recent web-update edits; loading a stale base
-        # makes the delete step miss the live blocks, so a re-update DUPLICATES the
-        # page instead of replacing it. full-sync round-trips the live state so the
-        # deletes below reference the live items.
-        # LIMITATION (verified): this is safe for a single-writer, clean,
-        # freshly-loaded page edited once. It is NOT guaranteed to converge if the
-        # server's live doc has diverged from this snapshot (concurrent edit, or a
-        # page already duplicated by a prior bad write): the web-update delete set
-        # is diffed locally (get_update(state_before)), not against the server's
-        # advertised state vector, so deletes can be dropped server-side and
-        # content can still stack. The post-write check below catches that case;
-        # recreate via create_page_from_markdown if it trips.
-        live_update = _full_sync_doc_state(workspace_id, view_id)
-        if not live_update:
-            raise Exception(
-                "full-sync returned no document state (is this a document page?)"
-            )
-        doc = Doc()
-        data = doc.get("data", type=Map)
-        doc.apply_update(live_update)
-        if "document" not in data:
-            raise Exception("Unexpected collab structure (no 'document' map)")
-        document = data["document"]
-        page_id = document["page_id"]
-        blocks = document["blocks"]
-        meta = document["meta"]
-        cm = meta["children_map"]
-        tm = meta["text_map"]
-        if page_id not in blocks:
-            raise Exception("Unexpected document structure (page block missing)")
-        page_children_key = blocks[page_id]["children"]
-
-        # State vector BEFORE the mutation, so get_update() below yields only the
-        # incremental change (deletes of old blocks + inserts of new ones) — that
-        # is what the web-update endpoint applies on top of the live collab.
-        state_before = doc.get_state()
         new_blocks = _markdown_to_blocks(markdown)
-        with doc.transaction():
-            # Delete every block except the root page block, along with its
-            # children_map and text_map entries (captured before the delete).
-            for bid in list(blocks.keys()):
-                if bid == page_id:
-                    continue
-                blk = blocks[bid]
-                keys = list(blk.keys())
-                ck = blk["children"] if "children" in keys else None
-                ext = blk["external_id"] if "external_id" in keys else None
-                del blocks[bid]
-                if ck is not None and ck in cm:
-                    del cm[ck]
-                if ext is not None and ext in tm:
-                    del tm[ext]
-            # Clear the page's children ordering array (slice-delete is O(n)).
-            del cm[page_children_key][:]
-            # Insert the new content under the (unchanged) page block.
-            for serde in new_blocks:
-                _add_block_to_crdt(
-                    serde, page_id, page_children_key, blocks, cm, tm, Map, Array, Text
-                )
+        expected = len(new_blocks)
 
-        update = doc.get_update(state_before)
-        _api(
-            "POST",
-            f"/api/workspace/v1/{workspace_id}/collab/{view_id}/web-update",
-            json_body={"doc_state": list(update), "collab_type": 0},
-        )
+        # Reconcile loop over the SYNCHRONOUS full-sync write. Each round:
+        #   1. load the CURRENT realtime doc (full-sync read returns the WHOLE live
+        #      doc, since we send an empty-doc state vector),
+        #   2. rewrite the page to exactly `new_blocks` (delete every live block +
+        #      insert the target) and push the incremental update via full-sync,
+        #      which the server applies synchronously,
+        #   3. VERIFY against a second, independent full-sync read.
+        # Each round re-reads the ACTUAL current blocks, so its delete set always
+        # names the structs the server currently holds — leftovers from a prior
+        # divergence are loaded as real items and deleted. A clean page converges
+        # in one round; a badly-duplicated one in a few.
+        #
+        # Verification is a fresh empty-sv read (which unconditionally returns the
+        # entire live doc), NOT the write's post-apply diff: that diff only carries
+        # structs newer than our state vector, so a leftover block older than the
+        # snapshot would be invisible to it and we'd false-pass. An independent read
+        # can't hide leftovers. This replaces the old async web-update + racy
+        # settle-loop (which could only DETECT divergence and bail to a recreate,
+        # losing the view_id).
+        MAX_ROUNDS = 5
+        observed = None
+        rounds = 0
+        for rounds in range(1, MAX_ROUNDS + 1):
+            doc, data = _load_live_document(workspace_id, view_id)
+            update_bytes = bytes(_rewrite_page_to_blocks(doc, data, new_blocks))
+            if len(update_bytes) <= 2:
+                # Empty/no-op update (yrs encodes "nothing changed" as ~2 bytes) —
+                # the live page already matches the target; nothing to write. The
+                # read above is itself the verification.
+                observed = _page_top_level_count(data)
+                break
+            _full_sync_exchange(
+                workspace_id, view_id, bytes(doc.get_state()), update_bytes, 0
+            )
+            # Independent fresh read = the true server state after the write.
+            _vdoc, vdata = _load_live_document(workspace_id, view_id)
+            observed = _page_top_level_count(vdata)
+            if observed == expected:
+                break
 
         result = {
-            "ok": True,
+            "ok": observed == expected,
             "view_id": view_id,
-            "blocks": len(new_blocks),
-            "note": "update submitted; re-read with get_page_markdown to confirm",
+            "blocks": expected,
+            "rounds": rounds,
+            "verified_top_level_blocks": observed,
         }
-        # Post-write verification with a SETTLE loop. The realtime server applies
-        # the web-update asynchronously, so an immediate re-read races: it can
-        # false-pass (count transiently right before the merge finishes) or
-        # false-fail (count read mid-merge). Poll the live top-level count until it
-        # is stable across two consecutive reads, THEN decide. If it never settles,
-        # stay advisory (do NOT hard-fail — a false ok=false would push the caller
-        # to needlessly recreate and lose the view_id). The count should equal the
-        # number of top-level blocks just written; a stable mismatch means the
-        # delete set didn't converge against the realtime doc (divergence).
-        expected = len(new_blocks)
-        counts: list[int] = []
-        try:
-            for attempt in range(4):
-                if attempt:
-                    time.sleep(0.4)
-                verify = _full_sync_doc_state(workspace_id, view_id)
-                vdoc = Doc()
-                vdata = vdoc.get("data", type=Map)
-                vdoc.apply_update(verify)
-                vdocument = vdata["document"]
-                vpage = vdocument["page_id"]
-                vkey = vdocument["blocks"][vpage]["children"]
-                counts.append(len(list(vdocument["meta"]["children_map"][vkey])))
-                if len(counts) >= 2 and counts[-1] == counts[-2]:
-                    break
-            settled = counts[-1] if (len(counts) >= 2 and counts[-1] == counts[-2]) else None
-            if settled is None:
-                result["note"] += (
-                    f" (post-write count did not settle {counts}; re-read to confirm)"
-                )
-            elif settled != expected:
-                result["ok"] = False
-                result["warning"] = (
-                    f"post-write check FAILED: page settled at {settled} top-level "
-                    f"blocks but {expected} were written — the in-place replace did "
-                    "not converge (live doc likely diverged from the snapshot); the "
-                    "page may be duplicated/partial. Recreate via "
-                    "create_page_from_markdown."
-                )
-            else:
-                result["verified_top_level_blocks"] = settled
-        except Exception as e:
-            result["note"] += f" (post-write verify skipped: {e})"
+        if observed != expected:
+            result["warning"] = (
+                f"in-place replace did not converge after {rounds} rounds "
+                f"(page settled at {observed} top-level blocks but {expected} were "
+                "written) — the live doc may be concurrently edited or badly "
+                "corrupted. Recreate via create_page_from_markdown."
+            )
         return result
     except Exception as e:
         raise Exception(f"Failed to update page from markdown: {str(e)}")
