@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import string
+import time
 from pathlib import Path
 from typing import Any
 
@@ -197,8 +198,15 @@ def _encode_collab_doc_state_params(
 
 def _zstd_decompress(data: bytes) -> bytes:
     import io
-    import zstandard  # only imported if a deployment compresses the response
 
+    try:
+        import zstandard  # not a hard dep: this build returns raw, never zstd
+    except ImportError as e:
+        raise Exception(
+            "full-sync response is zstd-compressed but `zstandard` isn't "
+            "installed — add `zstandard` to pyproject.toml AND the MCP launch "
+            f"--with args, then reload ({e})"
+        )
     dctx = zstandard.ZstdDecompressor()
     with dctx.stream_reader(io.BytesIO(data)) as r:
         return r.read()
@@ -1425,29 +1433,47 @@ def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown
             "blocks": len(new_blocks),
             "note": "update submitted; re-read with get_page_markdown to confirm",
         }
-        # Post-write verification: re-read the live doc and confirm the page now has
-        # exactly len(new_blocks) top-level children. A mismatch means the delete
-        # set didn't apply against the realtime doc (identity divergence) and the
-        # content stacked — fail loudly so the caller doesn't trust a duplicated page.
+        # Post-write verification with a SETTLE loop. The realtime server applies
+        # the web-update asynchronously, so an immediate re-read races: it can
+        # false-pass (count transiently right before the merge finishes) or
+        # false-fail (count read mid-merge). Poll the live top-level count until it
+        # is stable across two consecutive reads, THEN decide. If it never settles,
+        # stay advisory (do NOT hard-fail — a false ok=false would push the caller
+        # to needlessly recreate and lose the view_id). The count should equal the
+        # number of top-level blocks just written; a stable mismatch means the
+        # delete set didn't converge against the realtime doc (divergence).
+        expected = len(new_blocks)
+        counts: list[int] = []
         try:
-            verify = _full_sync_doc_state(workspace_id, view_id)
-            vdoc = Doc()
-            vdata = vdoc.get("data", type=Map)
-            vdoc.apply_update(verify)
-            vdocument = vdata["document"]
-            vpage = vdocument["page_id"]
-            vkey = vdocument["blocks"][vpage]["children"]
-            live_top = len(list(vdocument["meta"]["children_map"][vkey]))
-            if live_top != len(new_blocks):
+            for attempt in range(4):
+                if attempt:
+                    time.sleep(0.4)
+                verify = _full_sync_doc_state(workspace_id, view_id)
+                vdoc = Doc()
+                vdata = vdoc.get("data", type=Map)
+                vdoc.apply_update(verify)
+                vdocument = vdata["document"]
+                vpage = vdocument["page_id"]
+                vkey = vdocument["blocks"][vpage]["children"]
+                counts.append(len(list(vdocument["meta"]["children_map"][vkey])))
+                if len(counts) >= 2 and counts[-1] == counts[-2]:
+                    break
+            settled = counts[-1] if (len(counts) >= 2 and counts[-1] == counts[-2]) else None
+            if settled is None:
+                result["note"] += (
+                    f" (post-write count did not settle {counts}; re-read to confirm)"
+                )
+            elif settled != expected:
                 result["ok"] = False
                 result["warning"] = (
-                    f"post-write check FAILED: page has {live_top} top-level blocks "
-                    f"but {len(new_blocks)} were written — the in-place replace did "
-                    "not fully apply (realtime delete-identity divergence); the page "
-                    "is likely duplicated. Recreate via create_page_from_markdown."
+                    f"post-write check FAILED: page settled at {settled} top-level "
+                    f"blocks but {expected} were written — the in-place replace did "
+                    "not converge (live doc likely diverged from the snapshot); the "
+                    "page may be duplicated/partial. Recreate via "
+                    "create_page_from_markdown."
                 )
             else:
-                result["verified_top_level_blocks"] = live_top
+                result["verified_top_level_blocks"] = settled
         except Exception as e:
             result["note"] += f" (post-write verify skipped: {e})"
         return result
