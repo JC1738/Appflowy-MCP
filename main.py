@@ -1130,6 +1130,183 @@ def appflowy_create_page_from_markdown(
         raise Exception(f"Failed to create page from markdown: {str(e)}")
 
 
+# ---- In-place page-content replace via pycrdt collab surgery (CT-13) ----
+# There is no "clear/replace blocks" REST endpoint (only append-block / move /
+# trash / icon — verified in src/api/workspace.rs). To replace a page's body
+# while preserving its view_id, we mutate the document CRDT directly: load the
+# raw doc_state into a pycrdt.Doc, delete every block except the root page block
+# (plus its children_map / text_map entries), insert the new blocks, then push
+# the resulting *incremental* yrs update to the web-update endpoint (the same
+# path the web client uses for edits): POST /api/workspace/v1/{ws}/collab/{view}
+# /web-update  body {doc_state:[u8...], collab_type:0}.
+#
+# Document CRDT schema (confirmed live):
+#   data.document = {page_id, blocks, meta:{children_map, text_map}}
+#   block = {id, ty, data:<json str, delta excluded>, parent, children:<cm key>,
+#            external_id:<tm key|None>, external_type:"text"|None}
+#   children_map[key] = [child_block_id, ...]   (empty array for leaves)
+#   text_map[external_id] = YText (formatted delta lives here, NOT in block.data)
+
+
+def _add_block_to_crdt(serde, parent_id, parent_children_key, blocks, cm, tm, Map, Array, Text):
+    """Materialize one nested SerdeBlock (and its children) into the CRDT maps.
+
+    `serde` is a {type, data:{...,delta?}, children:[...]} dict from
+    _markdown_to_blocks. delta (if present) is moved out of block.data into a new
+    text_map YText; block.data keeps only the non-delta fields (level/checked/
+    language/...). Block ids are generated here (the server does NOT assign ids on
+    this path, unlike the page-view create/append endpoints).
+    """
+    bid = _gen_id(10)
+    ch_key = _gen_id(10)
+    data = dict(serde.get("data") or {})
+    delta = data.pop("delta", None)
+    block = {
+        "id": bid,
+        "ty": serde["type"],
+        "data": json.dumps(data, separators=(",", ":")),
+        "parent": parent_id,
+        "children": ch_key,
+    }
+    ext = None
+    if delta is not None:
+        ext = _gen_id(10)
+        block["external_id"] = ext
+        block["external_type"] = "text"
+    else:
+        block["external_id"] = None
+        block["external_type"] = None
+    blocks[bid] = Map(block)
+    cm[ch_key] = Array([])
+    if delta is not None:
+        text = Text()
+        tm[ext] = text
+        # Insert the plain text once, then apply each attributed run as a bounded
+        # range with format(). Inserting attributed text adjacent to plain text
+        # makes yrs *extend* the mark into the neighbour (formatting bleed), so we
+        # never pass attributes to insert() — format() on a fixed [start,stop) is
+        # the only bleed-free way to write a rich-text delta.
+        # Offsets are code points: correct for BMP text. KNOWN LIMITATION — a
+        # block that mixes astral characters (emoji) AND inline marks can have a
+        # mark misaligned (a pycrdt/yrs quirk with surrogate indexing); plain
+        # emoji text is unaffected (insert handles it; no format() is called).
+        full = "".join(op.get("insert", "") for op in delta)
+        if full:
+            text.insert(0, full)
+        idx = 0
+        for op in delta:
+            ins = op.get("insert", "")
+            if not ins:
+                continue
+            attrs = op.get("attributes") or None
+            if attrs:
+                text.format(idx, idx + len(ins), attrs)
+            idx += len(ins)
+    cm[parent_children_key].append(bid)
+    for child in serde.get("children") or []:
+        _add_block_to_crdt(child, bid, ch_key, blocks, cm, tm, Map, Array, Text)
+
+
+@mcp.tool(
+    name="appflowy_update_page_from_markdown",
+    description=(
+        "Replace an existing document page's entire content with blocks "
+        "converted from Markdown, IN PLACE — the page's view_id is preserved so "
+        "inbound links/bookmarks survive (unlike recreating the page). The old "
+        "content is fully removed. Supports the same Markdown as "
+        "create_page_from_markdown (headings, bulleted/numbered/todo lists with "
+        "nesting, quotes, code fences, dividers, GFM tables, inline bold/italic/"
+        "code/strikethrough/links). Pass empty markdown to clear the page. "
+        "NOTE: this is a read-modify-write on the page CRDT with no locking, so "
+        "it is not safe against another client editing the SAME page "
+        "concurrently (intended for agent-owned docs); on a 2xx it reports the "
+        "update as submitted — re-read with get_page_markdown to confirm."
+    ),
+)
+def appflowy_update_page_from_markdown(workspace_id: str, view_id: str, markdown: str):
+    _require_access_token()
+    try:
+        try:
+            from pycrdt import Doc, Map, Array, Text
+        except Exception as e:
+            raise Exception(
+                "pycrdt is required for in-place page updates but is not "
+                f"available: {e} (add `--with pycrdt` to the MCP launch args)"
+            )
+        # Fetch the raw document CRDT (doc_state) — the binary collab endpoint,
+        # not the flattened /json one (which can't be re-encoded losslessly).
+        raw = _api(
+            "GET",
+            f"/api/workspace/{workspace_id}/collab/{view_id}",
+            json_body={
+                "workspace_id": workspace_id,
+                "inner": {"object_id": view_id, "collab_type": 0},
+            },
+        )
+        doc_state = raw.get("data", {}).get("doc_state")
+        if not doc_state:
+            raise Exception(
+                "Could not fetch document doc_state (is this a document page?)"
+            )
+        doc = Doc()
+        data = doc.get("data", type=Map)
+        doc.apply_update(bytes(doc_state))
+        if "document" not in data:
+            raise Exception("Unexpected collab structure (no 'document' map)")
+        document = data["document"]
+        page_id = document["page_id"]
+        blocks = document["blocks"]
+        meta = document["meta"]
+        cm = meta["children_map"]
+        tm = meta["text_map"]
+        if page_id not in blocks:
+            raise Exception("Unexpected document structure (page block missing)")
+        page_children_key = blocks[page_id]["children"]
+
+        # State vector BEFORE the mutation, so get_update() below yields only the
+        # incremental change (deletes of old blocks + inserts of new ones) — that
+        # is what the web-update endpoint applies on top of the live collab.
+        state_before = doc.get_state()
+        new_blocks = _markdown_to_blocks(markdown)
+        with doc.transaction():
+            # Delete every block except the root page block, along with its
+            # children_map and text_map entries (captured before the delete).
+            for bid in list(blocks.keys()):
+                if bid == page_id:
+                    continue
+                blk = blocks[bid]
+                keys = list(blk.keys())
+                ck = blk["children"] if "children" in keys else None
+                ext = blk["external_id"] if "external_id" in keys else None
+                del blocks[bid]
+                if ck is not None and ck in cm:
+                    del cm[ck]
+                if ext is not None and ext in tm:
+                    del tm[ext]
+            # Clear the page's children ordering array (slice-delete is O(n)).
+            del cm[page_children_key][:]
+            # Insert the new content under the (unchanged) page block.
+            for serde in new_blocks:
+                _add_block_to_crdt(
+                    serde, page_id, page_children_key, blocks, cm, tm, Map, Array, Text
+                )
+
+        update = doc.get_update(state_before)
+        _api(
+            "POST",
+            f"/api/workspace/v1/{workspace_id}/collab/{view_id}/web-update",
+            json_body={"doc_state": list(update), "collab_type": 0},
+        )
+        return {
+            "ok": True,
+            "view_id": view_id,
+            "blocks": len(new_blocks),
+            "note": "update submitted; re-read with get_page_markdown to confirm",
+        }
+    except Exception as e:
+        raise Exception(f"Failed to update page from markdown: {str(e)}")
+
+
 @mcp.tool(
     name="appflowy_create_orphaned_view",
     description="Create a view without a parent folder or page.",
