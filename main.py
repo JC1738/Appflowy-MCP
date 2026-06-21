@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -1282,16 +1283,58 @@ def appflowy_unpublish_page(workspace_id: str, view_id: str):
 
 @mcp.tool(
     name="appflowy_import_zip",
-    description="Upload and import a zip file into AppFlowy Cloud.",
+    description=(
+        "Import a Notion-export zip into AppFlowy. Creates a NEW workspace named "
+        "from the file (processed async by the worker; allow a minute or two). "
+        "Pass the INNER markdown-tree zip — Notion wraps exports as a zip-of-zips "
+        "(…Part-1.zip); feed the inner one, not the outer wrapper."
+    ),
 )
 def appflowy_import_zip(file_path: str):
+    # Direct multipart POST: AppFlowy's /api/import requires X-Content-Length and
+    # X-Content-MD5 (base64 md5) headers matching the upload, which the SDK's
+    # import_zip omits (so it 400s on md5 mismatch). 401 -> refresh once + retry.
     _require_access_token()
     path = Path(file_path)
     if not path.exists():
         raise Exception(f"File not found: {file_path}")
     try:
-        client.import_zip(path.read_bytes())
-        return {"ok": True}
+        content = path.read_bytes()
+        md5_b64 = base64.b64encode(hashlib.md5(content).digest()).decode()
+
+        def _post():
+            token = _require_access_token()
+            try:
+                return httpx.post(
+                    f"{BASE_URL}/api/import",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Content-Length": str(len(content)),
+                        "X-Content-MD5": md5_b64,
+                    },
+                    files={"file": ("import.zip", content, "application/zip")},
+                    timeout=120.0,
+                )
+            except httpx.RequestError as e:
+                raise Exception(f"Network error calling POST /api/import: {e}") from e
+
+        resp = _post()
+        if resp.status_code == 401:  # short-lived token; refresh once and retry
+            try:
+                client.refresh_token()
+            except Exception as e:
+                raise Exception(
+                    f"POST /api/import -> 401 and token refresh failed: {e} "
+                    "(call appflowy_login first)"
+                ) from e
+            resp = _post()
+        if resp.status_code >= 400:
+            raise Exception(f"/api/import -> {resp.status_code}: {resp.text[:300]}")
+        return {
+            "ok": True,
+            "note": "Import queued (async via worker); creates a new workspace "
+            "named 'file' — rename it afterward.",
+        }
     except Exception as e:
         raise Exception(f"Failed to import zip: {str(e)}")
 
